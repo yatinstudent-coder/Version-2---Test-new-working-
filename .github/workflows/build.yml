@@ -192,7 +192,7 @@ jobs:
         run: |
           cat > /tmp/fresh_project/android/build.gradle << 'ROOTGRADLE'
           buildscript {
-              ext.kotlin_version = '1.9.0'
+              ext.kotlin_version = '1.9.23'
               repositories {
                   google()
                   mavenCentral()

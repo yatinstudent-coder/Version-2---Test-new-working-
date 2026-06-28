@@ -104,7 +104,7 @@ class CascadeEngine {
 
     // ── STAGE 1: GATE ─────────────────────────────────────────────────
     gateCalledCount++;
-    final gate = await _gemini.runGate(frameBytes);
+    final gate = await _gemini.runGate(frameBytes, sensors);
     lastGate = gate;
     _gateLatencies.add(gate.latencyMs);
     if (_gateLatencies.length > 50) _gateLatencies.removeAt(0);
@@ -124,7 +124,7 @@ class CascadeEngine {
 
     // ── STAGE 2: CLASSIFY ─────────────────────────────────────────────
     classifyCount++;
-    final detection = await _gemini.classify(frameBytes);
+    final detection = await _gemini.classify(frameBytes, sensors);
     lastDetection   = detection;
     _classifyLatencies.add(detection.latencyMs);
     if (_classifyLatencies.length > 50) _classifyLatencies.removeAt(0);
@@ -235,10 +235,13 @@ class CascadeEngine {
       cueText = 'Caution — ${_velocity.approachDescription}. $cueText';
     }
 
-    // Add sensor distance for close obstacles
-    if (sensors.center < AppConfig.dangerDistance) {
-      final dist = sensors.center.round();
-      cueText = '$cueText ($dist cm)';
+    // Add sensor-grounded distance for close obstacles.
+    // Prefer det.distanceCm (the position-matched sensor reading Gemini
+    // was given and told to report back) over the raw center sensor,
+    // since the obstacle may be on the left/right rather than center.
+    final groundedDist = det.distanceCm ?? sensors.center.round();
+    if (groundedDist < AppConfig.dangerDistance) {
+      cueText = '$cueText ($groundedDist cm)';
     }
 
     return NavCue(
@@ -569,5 +572,3 @@ class CascadeEngine {
     'tts': _tts.stats,
   };
 }
-
-

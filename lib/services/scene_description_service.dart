@@ -5,141 +5,149 @@ import '../config.dart';
 import '../models/sensor_data.dart';
 import '../models/detection_result.dart';
 
-/// SceneDescriptionService provides rich ambient awareness descriptions.
-/// Unlike the cascade pipeline which describes obstacles, this service
-/// describes the WHOLE SCENE in natural language.
-///
-/// Examples of output:
-/// "You appear to be in a busy shopping centre. There are several people
-///  moving in different directions ahead of you. A shop entrance is on
-///  your left about three metres away."
-///
-/// "You are in a quiet office corridor. A person is walking away from
-///  you about four metres ahead. The path is clear on both sides."
-///
-/// Triggered by 6 smart parameters — never called every frame.
+enum SceneComplexity { simple, detailed, complex }
 
 class SceneDescriptionService {
 
-  // ── Cooldown tracking ─────────────────────────────────────────────────
   DateTime _lastAnyDescription   = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastProximityTrigger = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastAmbiguousTrigger = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastInconsistency    = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastStationary       = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastComplexTrigger   = DateTime.fromMillisecondsSinceEpoch(0);
 
-  // ── Rolling state ─────────────────────────────────────────────────────
-  final List<bool>   _gateHistory     = [];   // last 4 gate results
-  final List<double> _centerHistory   = [];   // last 8 center readings
+  final List<bool>   _gateHistory     = [];
+  final List<double> _centerHistory   = [];
   final List<double> _leftHistory     = [];
   final List<double> _rightHistory    = [];
-  final List<String> _crowdingHistory = [];   // last 3 crowding readings
+  final List<String> _crowdingHistory = [];
+  final List<String> _labelHistory    = [];  // last detected labels
 
-  // ── Output ────────────────────────────────────────────────────────────
-  String _lastDescription = '';
-  String _lastTrigger     = '';
-  bool   _isLoading       = false;
+  String          _lastDescription = '';
+  String          _lastTrigger     = '';
+  SceneComplexity _lastComplexity  = SceneComplexity.simple;
+  bool            _isLoading       = false;
 
-  // ── Counters ──────────────────────────────────────────────────────────
-  int totalCalls         = 0;
-  int proximityCount     = 0;
-  int ambiguousCount     = 0;
-  int inconsistencyCount = 0;
-  int stationaryCount    = 0;
-  int periodicCount      = 0;
-  int crowdedCount       = 0;
-
-  // ── Settings (adjustable) ─────────────────────────────────────────────
-  double proximityThreshold = 120.0;  // cm
-  int    periodicSeconds    = 20;     // seconds between periodic calls
+  // Stats
+  int totalCalls           = 0;
+  int simpleCalls          = 0;
+  int detailedCalls        = 0;
+  int complexCalls         = 0;
+  int proximityCount       = 0;
+  int ambiguousCount       = 0;
+  int inconsistencyCount   = 0;
+  int stationaryCount      = 0;
+  int periodicCount        = 0;
+  int crowdedCount         = 0;
+  int movingObjectCount    = 0;
+  int complexSceneCount    = 0;
 
   String get lastDescription => _lastDescription;
   String get lastTrigger     => _lastTrigger;
   bool   get isLoading       => _isLoading;
+  SceneComplexity get lastComplexity => _lastComplexity;
 
-  // THE SCENE DESCRIPTION PROMPT
-  // Much richer than the navigation prompt — describes the whole scene
-  static const String _scenePrompt = '''
-You are describing an environment to a blind person who is navigating
-on foot with a chest-mounted camera. Give them a complete picture of
-their surroundings so they understand where they are and what is around
-them.
-
-Respond in 2-3 natural spoken sentences. Write as if you are calmly
-speaking to the person directly.
-
-Include:
-- What type of space this appears to be (shop, corridor, street, office,
-  home, restaurant, station, etc.)
-- How busy or crowded it is and what people are doing
-- Key landmarks or features that help with orientation (doors, counters,
-  walls, turns, exits visible)
-- Any hazards or things requiring attention beyond the immediate obstacle
-- The general feel of the space (open, narrow, busy, quiet)
-
-Do NOT:
-- Mention colours unless critical for navigation
-- Use technical language
-- Start with "I can see" or "The image shows"
-- Describe decorations or irrelevant details
-- Be longer than 3 sentences
-
-Write as natural spoken English — this will be read aloud by a text
-to speech engine.
-
-Examples of GOOD responses:
-
-"You appear to be in a busy supermarket aisle. There are several
- shoppers moving around you and a row of shelves on both sides.
- The aisle appears to open up ahead into a wider area."
-
-"You are in an office with several desks and people working. The
- space is moderately busy with people walking between workstations.
- There appears to be an open area ahead and a glass wall on your right."
-
-"You seem to be on a busy pavement outside. People are walking in
- both directions and there is a shop entrance on your left about
- two metres ahead. The path ahead appears clear for several metres."
-
-"You are in a quiet hospital corridor. The path ahead is clear and
- wide. There appears to be a reception desk or nurses station about
- five metres ahead on the right."
+  // ── SIMPLE prompt — quick ambient update ──────────────────────────────
+  static const String _simplePrompt = '''
+You are describing an environment to a blind person navigating on foot.
+Respond in exactly 2 natural spoken sentences.
+Write directly — do not start with "I can see" or "The image shows".
+Describe: the type of space, how busy it is, and any key navigation features.
+Write for text-to-speech — natural spoken English only.
 ''';
 
-  /// Check all 6 trigger parameters every frame.
-  /// Returns trigger reason string, or null if no description needed.
+  // ── DETAILED prompt — richer spatial awareness ────────────────────────
+  static const String _detailedPrompt = '''
+You are a navigation assistant for a blind person with a chest-mounted camera.
+Describe the scene in 3 sentences for text-to-speech.
+
+Sentence 1: What type of space is this and how busy is it?
+Sentence 2: What is the most important thing to know for navigation right now?
+Sentence 3: What is directly ahead and what action should the person take?
+
+Rules:
+- Use actual object names, not "obstacle" or "thing"
+- Include approximate distances (one metre, two metres, nearby, far ahead)
+- Mention if passage is narrow or wide
+- If people are present, describe what they are doing
+- Write as calm natural speech — no bullet points, no lists
+- Do not start with "I can see" or "The image shows"
+''';
+
+  // ── COMPLEX prompt — full situational awareness ───────────────────────
+  static const String _complexPrompt = '''
+You are providing full situational awareness to a blind person navigating
+in a complex indoor environment. This is called when the scene is
+particularly challenging — crowded, confusing, or has multiple hazards.
+
+Respond in 3-4 sentences of natural spoken English for text-to-speech.
+
+Cover ALL of these in your response:
+1. The type of space and overall layout (open, narrow, corridor, room, etc.)
+2. Where people are, what they are doing, and if any are moving toward the user
+3. The most immediate navigation challenge and exactly how to handle it
+4. What lies ahead beyond the immediate obstacle — is the path clear further on?
+
+Be specific:
+- Name actual objects (chair, glass door, staircase, reception desk)
+- Use distance language (about one metre, two or three metres ahead, far end)
+- If a passage is narrow, say so and estimate how tight it is
+- If multiple hazards exist, prioritise the most dangerous one first
+
+Do NOT:
+- Start with "I can see" or "The image shows"  
+- Say "obstacle" — always name the actual object
+- Mention colours unless critical (e.g. a red wet floor sign)
+- List things — write flowing natural sentences
+
+Examples of good complex descriptions:
+"You are in a busy office corridor with people moving in both directions.
+ A person is walking directly toward you about two metres ahead — stop and
+ move slightly to your right to let them pass. Beyond them the corridor
+ widens and appears clear for several metres, with a set of stairs visible
+ at the far end on the left."
+
+"You appear to be entering a crowded cafeteria or dining area. Several
+ people are seated at tables on both sides and two people are walking
+ across your path about one metre ahead from right to left — pause and
+ let them cross. The serving counter is visible ahead about four metres,
+ and there is a clear path through the centre once the crossing people pass."
+''';
+
   String? checkTriggers({
     required SensorData       sensors,
     required GateResult?      lastGate,
     required DetectionResult? lastDetection,
+    required VelocityTracker  velocity,
   }) {
     _updateState(sensors, lastGate, lastDetection);
     final now = DateTime.now();
 
-    // Minimum 4 seconds between ANY description calls
-    if (now.difference(_lastAnyDescription).inSeconds < 4) return null;
+    if (now.difference(_lastAnyDescription).inSeconds 
+        AppConfig.sceneDescMinGapSeconds) return null;
 
-    // ── TRIGGER 1: PROXIMITY ───────────────────────────────────────────
-    // Something is close — describe full scene for context
-    // Cooldown: 10 seconds
-    if (sensors.center < proximityThreshold &&
+    // TRIGGER 1: PROXIMITY — something close, describe scene for context
+    if (sensors.center < AppConfig.sceneDescProximityThreshold &&
         now.difference(_lastProximityTrigger).inSeconds >= 10) {
       return 'proximity';
     }
 
-    // ── TRIGGER 2: AMBIGUOUS GATE ───────────────────────────────────────
-    // Gate confidence between 0.35-0.65 — AI is uncertain
-    // A full scene description helps clarify the situation
-    // Cooldown: 8 seconds
+    // TRIGGER 2: MOVING OBJECT APPROACHING — urgent scene context
+    if (velocity.isApproaching &&
+        now.difference(_lastAnyDescription).inSeconds >= 8) {
+      movingObjectCount++;
+      return 'moving_object';
+    }
+
+    // TRIGGER 3: AMBIGUOUS GATE — AI not sure, describe scene to help
     final gateConf = lastGate?.confidence ?? 1.0;
-    if (gateConf >= 0.35 && gateConf <= 0.65 &&
+    if (gateConf >= AppConfig.sceneDescAmbiguousLow &&
+        gateConf <= AppConfig.sceneDescAmbiguousHigh &&
         now.difference(_lastAmbiguousTrigger).inSeconds >= 8) {
       return 'ambiguous';
     }
 
-    // ── TRIGGER 3: DETECTION INCONSISTENCY ───────────────────────────────
-    // Gate keeps changing YES/NO/YES/NO — scene is confusing
-    // Cooldown: 12 seconds
+    // TRIGGER 4: DETECTION INCONSISTENCY — flip-flopping results
     if (_gateHistory.length >= 4 &&
         now.difference(_lastInconsistency).inSeconds >= 12) {
       int switches = 0;
@@ -149,9 +157,7 @@ Examples of GOOD responses:
       if (switches >= 3) return 'inconsistency';
     }
 
-    // ── TRIGGER 4: STATIONARY ────────────────────────────────────────────
-    // User hasn't moved in a while — may be lost or confused
-    // Cooldown: 15 seconds
+    // TRIGGER 5: STATIONARY — user stopped, give full awareness
     if (_centerHistory.length >= 4 &&
         now.difference(_lastStationary).inSeconds >= 15) {
       final cVar = _variance(_centerHistory);
@@ -162,39 +168,101 @@ Examples of GOOD responses:
       }
     }
 
-    // ── TRIGGER 5: CROWDED ────────────────────────────────────────────────
-    // Gemini keeps detecting groups or multiple people
-    // Cooldown: 15 seconds
+    // TRIGGER 6: CROWDED — multiple people detected recently
     if (_crowdingHistory.length >= 3 &&
-        now.difference(_lastAnyDescription).inSeconds >= 15) {
+        now.difference(_lastAnyDescription).inSeconds >=
+            AppConfig.sceneDescCrowdedMinGap) {
       final recentCrowded = _crowdingHistory
           .where((c) => c == 'crowded' || c == 'moderate')
           .length;
       if (recentCrowded >= 2) return 'crowded';
     }
 
-    // ── TRIGGER 6: PERIODIC ───────────────────────────────────────────────
-    // Regular ambient update when path is clear
-    // Cooldown: periodicSeconds (default 20)
+    // TRIGGER 7: COMPLEX SCENE — multiple different obstacle types
+    if (_labelHistory.length >= 3 &&
+        now.difference(_lastComplexTrigger).inSeconds >=
+            AppConfig.sceneDescComplexMinGap) {
+      final uniqueTypes = _labelHistory.toSet().length;
+      if (uniqueTypes >= AppConfig.complexSceneMultiObstacleCount) {
+        complexSceneCount++;
+        return 'complex_scene';
+      }
+    }
+
+    // TRIGGER 8: NARROW PASSAGE detected
+    if (lastDetection?.environment.narrowPassage == true &&
+        now.difference(_lastAnyDescription).inSeconds >= 10) {
+      return 'narrow_passage';
+    }
+
+    // TRIGGER 9: FLOOR HAZARD detected
+    if (lastDetection?.environment.floorHazards == true &&
+        now.difference(_lastAnyDescription).inSeconds >= 8) {
+      return 'floor_hazard';
+    }
+
+    // TRIGGER 10: PERIODIC AMBIENT — regular update when path clear
     final allClear = sensors.center > 150 &&
                      sensors.left   > 120 &&
                      sensors.right  > 120;
     if (allClear &&
-        now.difference(_lastAnyDescription).inSeconds >= periodicSeconds) {
+        now.difference(_lastAnyDescription).inSeconds >=
+            AppConfig.sceneDescPeriodicSeconds) {
       return 'periodic';
     }
 
     return null;
   }
 
-  /// Call Gemini for a full scene description.
-  /// Fire-and-forget from cascade_engine — never blocks navigation cue.
+  /// Choose which prompt complexity to use based on trigger reason.
+  SceneComplexity _complexityForTrigger(String reason) {
+    switch (reason) {
+      case 'complex_scene':
+      case 'crowded':
+      case 'inconsistency':
+        return SceneComplexity.complex;
+      case 'moving_object':
+      case 'stationary':
+      case 'narrow_passage':
+      case 'floor_hazard':
+        return SceneComplexity.detailed;
+      default:
+        return SceneComplexity.simple;
+    }
+  }
+
+  String _promptForComplexity(SceneComplexity complexity) {
+    switch (complexity) {
+      case SceneComplexity.complex:  return _complexPrompt;
+      case SceneComplexity.detailed: return _detailedPrompt;
+      case SceneComplexity.simple:   return _simplePrompt;
+    }
+  }
+
+  int _maxTokensForComplexity(SceneComplexity complexity) {
+    switch (complexity) {
+      case SceneComplexity.complex:  return 250;
+      case SceneComplexity.detailed: return 180;
+      case SceneComplexity.simple:   return 100;
+    }
+  }
+
   Future<String?> describe(
       Uint8List imageBytes, String triggerReason) async {
     if (!AppConfig.isApiKeySet) return null;
 
     _isLoading   = true;
     _lastTrigger = triggerReason;
+
+    final complexity = _complexityForTrigger(triggerReason);
+    _lastComplexity  = complexity;
+
+    // Update complexity counters
+    switch (complexity) {
+      case SceneComplexity.simple:   simpleCalls++;   break;
+      case SceneComplexity.detailed: detailedCalls++; break;
+      case SceneComplexity.complex:  complexCalls++;  break;
+    }
 
     try {
       final response = await http.post(
@@ -205,7 +273,7 @@ Examples of GOOD responses:
         body: jsonEncode({
           'contents': [{
             'parts': [
-              {'text': _scenePrompt},
+              {'text': _promptForComplexity(complexity)},
               {
                 'inline_data': {
                   'mime_type': 'image/jpeg',
@@ -215,12 +283,13 @@ Examples of GOOD responses:
             ]
           }],
           'generationConfig': {
-            'temperature':     0.3,
-            'maxOutputTokens': 150,
+            'temperature':     complexity == SceneComplexity.complex
+                                   ? 0.4 : 0.2,
+            'maxOutputTokens': _maxTokensForComplexity(complexity),
             'topP':            0.9,
           },
         }),
-      ).timeout(const Duration(seconds: 7));
+      ).timeout(Duration(seconds: AppConfig.geminiTimeoutSecs));
 
       _isLoading = false;
 
@@ -238,6 +307,7 @@ Examples of GOOD responses:
       totalCalls++;
       _updateCooldown(triggerReason);
 
+      print('[scene] [$triggerReason/${complexity.name}] $text');
       return text;
 
     } catch (e) {
@@ -249,7 +319,6 @@ Examples of GOOD responses:
 
   void _updateState(
       SensorData s, GateResult? g, DetectionResult? d) {
-    // Update rolling sensor history
     _centerHistory.add(s.center);
     _leftHistory.add(s.left);
     _rightHistory.add(s.right);
@@ -259,16 +328,17 @@ Examples of GOOD responses:
       _rightHistory.removeAt(0);
     }
 
-    // Update gate history
     if (g != null) {
       _gateHistory.add(g.obstacleDetected);
       if (_gateHistory.length > 4) _gateHistory.removeAt(0);
     }
 
-    // Update crowding history from Gemini detections
     if (d != null && d.success) {
       _crowdingHistory.add(d.environment.crowding);
       if (_crowdingHistory.length > 3) _crowdingHistory.removeAt(0);
+
+      _labelHistory.add(d.label.name);
+      if (_labelHistory.length > 5) _labelHistory.removeAt(0);
     }
   }
 
@@ -297,6 +367,11 @@ Examples of GOOD responses:
       case 'periodic':
         periodicCount++;
         break;
+      case 'complex_scene':
+        _lastComplexTrigger = now;
+        break;
+      case 'moving_object':
+        break;
     }
   }
 
@@ -309,24 +384,35 @@ Examples of GOOD responses:
 
   String triggerLabel(String reason) {
     const labels = {
-      'proximity':     'Obstacle approaching',
-      'ambiguous':     'Unclear detection',
-      'inconsistency': 'Scene confusion',
-      'stationary':    'You stopped',
-      'crowded':       'Crowded environment',
-      'periodic':      'Ambient awareness',
+      'proximity':     '📍 Obstacle close',
+      'moving_object': '🏃 Moving object',
+      'ambiguous':     '❓ Unclear detection',
+      'inconsistency': '🔄 Scene confusion',
+      'stationary':    '⏸ User stopped',
+      'crowded':       '👥 Crowded space',
+      'complex_scene': '🧩 Complex scene',
+      'narrow_passage':'🚪 Narrow passage',
+      'floor_hazard':  '⚠️ Floor hazard',
+      'periodic':      '👁 Ambient update',
     };
     return labels[reason] ?? reason;
   }
 
   Map<String, dynamic> toStats() => {
-    'total_scene_calls':      totalCalls,
-    'proximity_triggers':     proximityCount,
-    'ambiguous_triggers':     ambiguousCount,
+    'total_scene_calls':     totalCalls,
+    'simple_calls':          simpleCalls,
+    'detailed_calls':        detailedCalls,
+    'complex_calls':         complexCalls,
+    'proximity_triggers':    proximityCount,
+    'moving_object_triggers': movingObjectCount,
+    'ambiguous_triggers':    ambiguousCount,
     'inconsistency_triggers': inconsistencyCount,
-    'stationary_triggers':    stationaryCount,
-    'crowded_triggers':       crowdedCount,
-    'periodic_triggers':      periodicCount,
+    'stationary_triggers':   stationaryCount,
+    'crowded_triggers':      crowdedCount,
+    'complex_scene_triggers': complexSceneCount,
+    'periodic_triggers':     periodicCount,
+    'last_trigger':          _lastTrigger,
+    'last_complexity':       _lastComplexity.name,
   };
 }
 

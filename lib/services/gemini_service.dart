@@ -2,14 +2,28 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import '../config.dart';
+import '../models/sensor_data.dart';
 import '../models/detection_result.dart';
 
 class GeminiService {
 
-  static const String _gatePrompt = '''
+  static String _gatePrompt(SensorData sensors) => '''
 You are the first stage of a navigation system for a blind person.
-Look at this image and answer ONE question: is there anything this
-person needs to know about to navigate safely?
+You have two sources of information: this camera image showing what is
+ahead, and live ultrasonic distance sensor readings taken at the exact
+same moment.
+
+Ultrasonic sensor readings right now:
+Left: ${sensors.left.round()}cm
+Center: ${sensors.center.round()}cm
+Right: ${sensors.right.round()}cm
+
+Use both together. The sensor readings are precise ground-truth distance
+measurements — trust them over any visual distance impression. The image
+tells you WHAT is there; the sensors tell you exactly HOW FAR.
+
+Answer ONE question: is there anything this person needs to know about
+to navigate safely?
 
 Answer ONLY with this exact JSON, nothing else:
 {"obstacle_detected": true, "confidence": 0.85}
@@ -24,25 +38,57 @@ obstacle_detected is TRUE if you see ANY of:
 - A narrow passage or corridor
 - Wet floor, hazard, or obstruction
 - A vehicle
+- Any sensor reading under 150cm, even if the image is unclear about what
+  is causing it — treat a close sensor reading as evidence something is
+  there even if you cannot visually confirm what it is
 
 obstacle_detected is FALSE only if:
 - The path ahead is completely clear for at least 3 metres
+- All three sensor readings are above 150cm
 - There is nothing a walking person could collide with
 
 confidence: your certainty 0.0 to 1.0
 No markdown. No explanation. Only the JSON.
 ''';
 
-  static const String _classifyPrompt = '''
+  static String _classifyPrompt(SensorData sensors) => '''
 You are a navigation assistant for a blind person walking with a
-chest-mounted camera. Analyze this image with extreme care.
+chest-mounted camera. You have two sources of information that you must
+fuse together into one coherent understanding of the room:
 
-Respond ONLY with this exact JSON structure, nothing else, no markdown:
+1. This camera image — shows what objects are present and what they are
+2. Live ultrasonic sensor readings taken at the exact same moment:
+   Left: ${sensors.left.round()}cm
+   Center: ${sensors.center.round()}cm
+   Right: ${sensors.right.round()}cm
+
+CRITICAL RULE ON DISTANCE: the ultrasonic readings above are precise
+ground-truth measurements. Always prefer them over your own visual
+distance estimate. Use the image to identify what the object actually
+is and confirm its position (left/center/right), but report distance
+based on the sensor reading for that direction, not on how far the
+object visually appears to be.
+
+If the sensor on a side is close (under 150cm) but you cannot clearly
+identify what is causing it from the image, still report it using the
+sensor distance, with type UNKNOWN and a specifics field describing
+the uncertainty (e.g. "something detected on the left, not clearly
+visible in frame").
+
+If the image and a sensor reading clearly conflict (e.g. the image
+shows nothing nearby on the left but the left sensor reads 30cm),
+trust the sensor and mention this discrepancy briefly in
+navigation_instruction, since the sensor may be detecting something
+outside the camera's field of view.
+
+Analyze with extreme care. Respond ONLY with this exact JSON structure,
+nothing else, no markdown:
 {
   "primary_obstacle": {
     "type": "PERSON",
     "specifics": "elderly woman with walking stick",
     "position": "center",
+    "distance_cm": 85,
     "distance_estimate": "very close",
     "moving": true,
     "moving_direction": "toward you"
@@ -51,6 +97,7 @@ Respond ONLY with this exact JSON structure, nothing else, no markdown:
     {
       "type": "CHAIR",
       "position": "right",
+      "distance_cm": 140,
       "distance_estimate": "nearby"
     }
   ],
@@ -61,7 +108,7 @@ Respond ONLY with this exact JSON structure, nothing else, no markdown:
     "floor_hazards": false,
     "narrow_passage": false
   },
-  "navigation_instruction": "Stop and wait. A person is walking directly toward you from about one metre ahead. Once they pass, proceed forward.",
+  "navigation_instruction": "Stop and wait. A person is walking directly toward you, about 85 centimetres ahead. Once they pass, proceed forward.",
   "urgency": "high",
   "confidence": 0.88,
   "uncertainty_reason": ""
@@ -74,7 +121,7 @@ PERSON, GROUP_OF_PEOPLE, CHILD, ANIMAL, CHAIR, TABLE, SOFA,
 DESK, BED, DOOR_OPEN, DOOR_CLOSED, STAIRS_UP, STAIRS_DOWN,
 STEP_UP, STEP_DOWN, WALL, PILLAR, GLASS_DOOR, VEHICLE,
 BICYCLE, SHOPPING_CART, TROLLEY, WET_FLOOR, NARROW_PASSAGE,
-COUNTER, SHELF, CLEAR
+COUNTER, SHELF, CLEAR, UNKNOWN
 
 primary_obstacle.specifics — describe exactly what you see in
 plain English, 3-8 words. Examples:
@@ -83,15 +130,24 @@ plain English, 3-8 words. Examples:
   "steep staircase going down"
   "group of children running"
   "shopping trolley blocking path"
+  "something detected on the left, not clearly visible"
 
 primary_obstacle.position — left, center, or right
+  Match this to whichever sensor reading is closest, unless the image
+  clearly shows the object is in a different position than the closest
+  sensor would suggest.
 
-primary_obstacle.distance_estimate — one of:
-  "very close" (under 1 metre)
-  "close" (1-2 metres)
-  "nearby" (2-4 metres)
-  "ahead" (4-6 metres)
-  "far" (over 6 metres)
+primary_obstacle.distance_cm — the actual sensor reading in centimetres
+  for whichever direction (left/center/right) this obstacle is in.
+  Use the exact number from the sensor data provided above. This must
+  be a plain integer, not a range or estimate.
+
+primary_obstacle.distance_estimate — one of, chosen based on distance_cm:
+  "very close" (under 60cm)
+  "close" (60-120cm)
+  "nearby" (120-250cm)
+  "ahead" (250-400cm)
+  "far" (over 400cm)
 
 primary_obstacle.moving — true if the obstacle is a person or
 animal that appears to be moving
@@ -101,11 +157,10 @@ primary_obstacle.moving_direction — only if moving is true:
   "crossing right to left", "stationary"
 
 secondary_obstacles — list any OTHER obstacles visible in the
-scene that could affect navigation. Can be empty list [].
+scene that could affect navigation, each with its own distance_cm
+taken from the sensor in that direction. Can be empty list [].
 
-environment.setting — describe the space in 2-3 words:
-  "indoor corridor", "busy shop", "outdoor pavement",
-  "office", "stairwell", "car park", "restaurant", etc.
+environment.setting — describe the space in 2-3 words
 
 environment.crowding — one of: "empty", "low", "moderate", "crowded"
 
@@ -115,41 +170,35 @@ environment.floor_hazards — true if you see wet floors, steps,
 uneven surfaces, cables, or anything the person could trip on
 
 environment.narrow_passage — true if the path ahead is less than
-1 metre wide
+1 metre wide, or if left and right sensors both read under 100cm
 
 navigation_instruction — THIS IS THE MOST IMPORTANT FIELD.
 Write a clear, natural, complete spoken instruction for a blind
-person. Be specific. Use the actual object you identified.
+person. Be specific. Use the actual object you identified and the
+exact sensor distance in centimetres, not a vague visual guess.
 Do NOT say "obstacle" — say what it actually is.
 Do NOT say just "move left" — explain WHY and by how much.
 
 Good examples:
-  "A person is walking toward you from the center. Stop and wait
-   two seconds for them to pass, then continue forward."
+  "A person is walking toward you from the center, about 90
+   centimetres away. Stop and wait two seconds for them to pass."
 
-  "There are stairs going down directly ahead, about two metres
-   away. Approach slowly and find the handrail on your right."
+  "There are stairs going down directly ahead, about 200 centimetres
+   away based on the sensor. Approach slowly and find the handrail."
 
-  "A glass door is ahead on your left, about one metre. It appears
-   to be open. You can pass through it."
-
-  "A chair is blocking the center path. Step to your left about
-   half a metre to go around it."
-
-  "The corridor narrows ahead. Move toward the center and proceed
-   slowly — about one metre clearance on each side."
-
-  "Three people are standing in a group directly ahead about two
-   metres. Move to your right to walk around them."
+  "A chair is blocking the center path, 75 centimetres ahead. Step to
+   your left to go around it."
 
 Bad examples (never do this):
   "Obstacle ahead, move left." ← too vague
   "Person detected." ← no instruction
-  "Move right." ← no context
+  "Move right." ← no context, ignores sensor distance
 
 urgency — one of: "low", "medium", "high", "critical"
-  critical: immediate danger (stairs, very close moving person)
-  high: action needed soon (person approaching, door, step)
+  critical: immediate danger (stairs, sensor under 40cm, very close
+            moving person)
+  high: action needed soon (person approaching, door, step, sensor
+        under 100cm)
   medium: awareness needed (furniture nearby, narrow passage)
   low: informational (something in periphery, not blocking path)
 
@@ -160,11 +209,12 @@ Otherwise empty string "".
 ''';
 
   /// Stage 1: Is there an obstacle? Fast binary check.
+  /// Now fuses sensor readings with the image.
   /// Never throws. Returns safe fallback (obstacle=true) on any error.
-  Future<GateResult> runGate(Uint8List imageBytes) async {
+  Future<GateResult> runGate(Uint8List imageBytes, SensorData sensors) async {
     final sw = Stopwatch()..start();
     try {
-      final raw  = await _callApi(_gatePrompt, imageBytes);
+      final raw  = await _callApi(_gatePrompt(sensors), imageBytes);
       sw.stop();
       final json = _cleanAndParse(raw);
       return GateResult(
@@ -180,11 +230,14 @@ Otherwise empty string "".
   }
 
   /// Stage 2: What is it, where is it, what should the user do?
+  /// Now fuses sensor readings with the image for accurate distance
+  /// and grounded object identification.
   /// Never throws. Returns fallback on any error.
-  Future<DetectionResult> classify(Uint8List imageBytes) async {
+  Future<DetectionResult> classify(
+      Uint8List imageBytes, SensorData sensors) async {
     final sw = Stopwatch()..start();
     try {
-      final raw  = await _callApi(_classifyPrompt, imageBytes);
+      final raw  = await _callApi(_classifyPrompt(sensors), imageBytes);
       sw.stop();
       final json = _cleanAndParse(raw);
 
@@ -211,6 +264,13 @@ Otherwise empty string "".
         narrowPassage: env['narrow_passage'] as bool?   ?? false,
       );
 
+      // Sensor-grounded distance: prefer the model's reported distance_cm
+      // (which it was told to copy from the sensor reading), falling back
+      // to the raw sensor value for that position if missing.
+      final reportedDistanceCm = (primary['distance_cm'] as num?)?.round();
+      final fallbackDistanceCm = _sensorDistanceForPosition(pos, sensors);
+      final groundedDistanceCm = reportedDistanceCm ?? fallbackDistanceCm;
+
       return DetectionResult(
         label:                 label,
         specifics:             primary['specifics']           as String? ?? '',
@@ -228,6 +288,7 @@ Otherwise empty string "".
         latencyMs:             sw.elapsedMilliseconds,
         success:               true,
         rawResponse:           raw,
+        distanceCm:            groundedDistanceCm,
       );
 
     } catch (e) {
@@ -235,6 +296,17 @@ Otherwise empty string "".
       print('[gemini] Classify error: $e');
       return DetectionResult.fallback(e.toString().substring(
           0, e.toString().length.clamp(0, 80)));
+    }
+  }
+
+  /// Picks the matching sensor reading for a given position, used as a
+  /// fallback if Gemini doesn't return distance_cm.
+  int _sensorDistanceForPosition(ObstaclePosition pos, SensorData sensors) {
+    switch (pos) {
+      case ObstaclePosition.left:   return sensors.left.round();
+      case ObstaclePosition.right:  return sensors.right.round();
+      case ObstaclePosition.center: return sensors.center.round();
+      case ObstaclePosition.unclear: return sensors.center.round();
     }
   }
 
@@ -258,7 +330,7 @@ Otherwise empty string "".
       }],
       'generationConfig': {
         'temperature':     0.1,
-        'maxOutputTokens': 250,
+        'maxOutputTokens': 280,
         'topP':            0.8,
       },
       'safetySettings': [
@@ -345,4 +417,3 @@ Otherwise empty string "".
     }
   }
 }
-

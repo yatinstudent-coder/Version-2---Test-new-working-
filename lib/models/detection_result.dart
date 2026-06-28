@@ -171,7 +171,7 @@ class NavCue {
   final DateTime        timestamp;
   final int             totalLatencyMs;
   final String?         sceneDescription;   // populated when scene desc fires
-  final String?         sceneTrigger;       // which parameter triggered it
+  final String?         sceneDescTrigger;   // which parameter triggered it
 
   const NavCue({
     required this.text,
@@ -183,7 +183,8 @@ class NavCue {
     required this.timestamp,
     required this.totalLatencyMs,
     this.sceneDescription,
-    this.sceneTrigger,
+    this.sceneDescTrigger,
   });
 }
+
 

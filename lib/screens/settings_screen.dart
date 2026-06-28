@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:image/image.dart' as img;
 import 'package:convert/convert.dart';
 import '../config.dart';
+import '../models/sensor_data.dart';
 import '../services/gemini_service.dart';
 import '../services/tts_service.dart';
 
@@ -73,7 +74,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final bytes = Uint8List.fromList(img.encodeJpg(image));
 
       final gemini = GeminiService();
-      final result = await gemini.runGate(bytes);
+      final result = await gemini.runGate(bytes, SensorData.empty());
 
       // Restore original key
       AppConfig.geminiApiKey = originalKey;
